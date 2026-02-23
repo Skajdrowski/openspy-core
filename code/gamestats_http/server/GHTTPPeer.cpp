@@ -12,6 +12,7 @@
 
 #include <sstream>
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <unordered_map>
 #include <unordered_set>
@@ -76,6 +77,36 @@ namespace {
 		auto it = q.find(k);
 		if (it == q.end()) return "";
 		return it->second;
+	}
+
+	static int from_hex(char c) {
+		if (c >= '0' && c <= '9') return c - '0';
+		if (c >= 'a' && c <= 'f') return 10 + (c - 'a');
+		if (c >= 'A' && c <= 'F') return 10 + (c - 'A');
+		return -1;
+	}
+
+	static std::string url_decode(const std::string &in) {
+		std::string out;
+		out.reserve(in.size());
+		for (size_t i = 0; i < in.size(); i++) {
+			char c = in[i];
+			if (c == '+') {
+				out.push_back(' ');
+				continue;
+			}
+			if (c == '%' && i + 2 < in.size()) {
+				int hi = from_hex(in[i + 1]);
+				int lo = from_hex(in[i + 2]);
+				if (hi >= 0 && lo >= 0) {
+					out.push_back((char)((hi << 4) | lo));
+					i += 2;
+					continue;
+				}
+			}
+			out.push_back(c);
+		}
+		return out;
 	}
 
 	static int to_int(const std::string &s, int def) {
@@ -224,9 +255,7 @@ namespace GHTTP {
 		OnConnectionReady();
 	}
 
-	Peer::~Peer() {
-		OS::LogText(OS::ELogLevel_Info, "[%s] Connection closed", getAddress().ToString().c_str());
-	}
+	Peer::~Peer(){}
 
 	void Peer::OnConnectionReady() {
 		OS::LogText(OS::ELogLevel_Info, "[%s] New HTTP connection", getAddress().ToString().c_str());
@@ -278,9 +307,9 @@ namespace GHTTP {
 			std::string part = (amp == std::string::npos) ? query.substr(start) : query.substr(start, amp - start);
 			size_t eq = part.find('=');
 			if (eq != std::string::npos) {
-				out[part.substr(0, eq)] = part.substr(eq + 1);
+				out[url_decode(part.substr(0, eq))] = url_decode(part.substr(eq + 1));
 			} else if (!part.empty()) {
-				out[part] = "";
+				out[url_decode(part)] = "";
 			}
 			if (amp == std::string::npos) break;
 			start = amp + 1;
@@ -289,7 +318,7 @@ namespace GHTTP {
 
 	void Peer::handle_http_request(const std::string &request) {
 		std::string method, target;
-		if (!parse_request_line(request, method, target) || method != "GET") {
+		if (!parse_request_line(request, method, target) || (method != "GET" && method != "HEAD")) {
 			send_http_response(400, "");
 			return;
 		}
@@ -310,11 +339,13 @@ namespace GHTTP {
 		std::string body;
 		if (path == "/sniperelpc/score.asp") {
 			body = handle_score(query);
+			if (method == "HEAD") body.clear();
 			send_http_response(200, body);
 			return;
 		}
 		if (path == "/sniperelpc/mission.asp") {
 			body = handle_mission(query);
+			if (method == "HEAD") body.clear();
 			send_http_response(200, body);
 			return;
 		}
@@ -345,7 +376,7 @@ namespace GHTTP {
 
 		if (!ctx) return out.str();
 
-		int rows = to_int(get_query_value(query, "rows"), 20);
+		int rows = to_int(get_query_value(query, "rows"), 10);
 		int pid = to_int(get_query_value(query, "pid"), -1);
 		int anchor = to_int(get_query_value(query, "score"), -1);
 
@@ -357,41 +388,71 @@ namespace GHTTP {
 		auto emit_row = [&](int rank1, int row_pid, long long score) {
 			out << rank1 << "|";
 			auto it = nick_map.find(row_pid);
-			out << (it != nick_map.end() ? it->second : "player") << "|";
+			out << (it != nick_map.end() ? it->second : "") << "|";
 			out << row_pid << "|";
 			out << score << "|";
 		};
 
-		if (pid != -1) {
-			redisReply *sreply = (redisReply *)redisCommand(ctx, "ZSCORE %s %d", key.c_str(), pid);
-			if (!sreply || sreply->type != REDIS_REPLY_STRING) {
-				if (sreply) freeReplyObject(sreply);
-				if (synthetic_fallback_enabled()) {
-					emit_row(1, pid, 0);
-				}
-				return out.str();
-			}
-			long long score = atoll(sreply->str);
-			freeReplyObject(sreply);
-
+		if (pid != -1 && anchor < 0) {
 			redisReply *rreply = (redisReply *)redisCommand(ctx, "ZREVRANK %s %d", key.c_str(), pid);
 			if (!rreply || rreply->type != REDIS_REPLY_INTEGER) {
 				if (rreply) freeReplyObject(rreply);
-				if (synthetic_fallback_enabled()) {
-					emit_row(1, pid, score);
-				}
 				return out.str();
 			}
-			int rank1 = (int)rreply->integer + 1;
+			int rank0 = (int)rreply->integer;
 			freeReplyObject(rreply);
-			nick_map = resolve_nicks({pid});
-			emit_row(rank1, pid, score);
+
+			if (rows <= 1) {
+				redisReply *sreply = (redisReply *)redisCommand(ctx, "ZSCORE %s %d", key.c_str(), pid);
+				if (!sreply || sreply->type != REDIS_REPLY_STRING) {
+					if (sreply) freeReplyObject(sreply);
+					return out.str();
+				}
+				long long score = atoll(sreply->str);
+				freeReplyObject(sreply);
+
+				nick_map = resolve_nicks({pid});
+				emit_row(rank0 + 1, pid, score);
+				return out.str();
+			}
+
+			int half = rows / 2;
+			int start = rank0 - half;
+			if (start < 0) start = 0;
+			int end = start + (rows - 1);
+
+			redisReply *reply = (redisReply *)redisCommand(ctx, "ZREVRANGE %s %d %d WITHSCORES", key.c_str(), start, end);
+			if (!reply || reply->type != REDIS_REPLY_ARRAY) {
+				if (reply) freeReplyObject(reply);
+				return out.str();
+			}
+			if (reply->elements < 2) {
+				freeReplyObject(reply);
+				return out.str();
+			}
+
+			{
+				std::vector<int> pids;
+				pids.reserve(reply->elements / 2);
+				for (size_t i = 0; i + 1 < reply->elements; i += 2) {
+					pids.push_back(atoi(reply->element[i]->str));
+				}
+				nick_map = resolve_nicks(pids);
+			}
+
+			for (size_t i = 0; i + 1 < reply->elements; i += 2) {
+				int row_pid = atoi(reply->element[i]->str);
+				long long score = atoll(reply->element[i + 1]->str);
+				emit_row(start + (int)(i / 2) + 1, row_pid, score);
+			}
+
+			freeReplyObject(reply);
 			return out.str();
 		}
 
 		redisReply *reply = NULL;
 		if (anchor >= 0) {
-			reply = (redisReply *)redisCommand(ctx, "ZREVRANGEBYSCORE %s %d -inf LIMIT 0 %d WITHSCORES", key.c_str(), anchor - 1, rows);
+			reply = (redisReply *)redisCommand(ctx, "ZREVRANGEBYSCORE %s %d -inf LIMIT 0 %d WITHSCORES", key.c_str(), anchor, rows);
 		} else {
 			reply = (redisReply *)redisCommand(ctx, "ZREVRANGE %s 0 %d WITHSCORES", key.c_str(), rows - 1);
 		}
@@ -402,9 +463,6 @@ namespace GHTTP {
 		}
 		if (reply->elements < 2) {
 			freeReplyObject(reply);
-			if (synthetic_fallback_enabled()) {
-				emit_row(1, 0, 0);
-			}
 			return out.str();
 		}
 
@@ -443,7 +501,7 @@ namespace GHTTP {
 
 		if (!ctx) return out.str();
 
-		int rows = to_int(get_query_value(query, "rows"), 20);
+		int rows = to_int(get_query_value(query, "rows"), 10);
 		int pid = to_int(get_query_value(query, "pid"), -1);
 		int anchor = to_int(get_query_value(query, "score"), -1);
 		int mission = to_int(get_query_value(query, "mission"), -1);
@@ -457,59 +515,50 @@ namespace GHTTP {
 		std::string key = zset_key_mission(mission);
 
 		std::unordered_map<int, std::string> nick_map;
+		auto fetch_stats = [&](int row_pid) {
+			std::array<long long, 14> vals;
+			vals.fill(0);
+			std::ostringstream hk;
+			hk << "gstats:sniperelpc:missionstats:" << mission << ":" << row_pid;
+			std::string hkey = hk.str();
+
+			redisReply *hreply = (redisReply *)redisCommand(
+				ctx,
+				"HMGET %s twoforone threeforone fourforone silentkill covertkill 2covertkill 3coverkill headshot moving healthlost accuracy longestshot pinpull difficulty",
+				hkey.c_str());
+			if (!hreply || hreply->type != REDIS_REPLY_ARRAY) {
+				if (hreply) freeReplyObject(hreply);
+				return vals;
+			}
+			for (size_t i = 0; i < hreply->elements && i < vals.size(); i++) {
+				redisReply *e = hreply->element[i];
+				if (!e) continue;
+				if (e->type == REDIS_REPLY_STRING && e->str) {
+					vals[i] = _strtoi64(e->str, nullptr, 10);
+				} else if (e->type == REDIS_REPLY_INTEGER) {
+					vals[i] = (long long)e->integer;
+				}
+			}
+			freeReplyObject(hreply);
+			return vals;
+		};
 		auto emit_row = [&](int rank1, int row_pid, long long total_score) {
 			out << rank1 << "|";
 			auto it = nick_map.find(row_pid);
-			out << (it != nick_map.end() ? it->second : "player") << "|";
+			out << (it != nick_map.end() ? it->second : "player" + std::to_string(row_pid)) << "|";
 			out << row_pid << "|";
-			for (int i = 0; i < 14; i++) {
-				out << 0 << "|";
+			auto stats = fetch_stats(row_pid);
+			for (size_t i = 0; i < stats.size(); i++) {
+				out << stats[i] << "|";
 			}
 			out << total_score << "|";
 		};
 
-		// Personal row lookup (used by Own Score and sometimes by War Record).
+		// Personal row lookup (used by Own Score in the game).
 		if (pid != -1 && anchor < 0) {
-			if (rows == 1) {
-				std::string state_key = make_state_key(getAddress(), pid);
-				bool war_record = should_treat_as_war_record(state_key, mission);
-				OS::LogText(OS::ELogLevel_Debug, "[%s] mission.asp pid+rows=1 classified_as=%s", getAddress().ToString().c_str(), war_record ? "war_record" : "own_score");
-
-				if (war_record) {
-					redisReply *top_reply = (redisReply *)redisCommand(ctx, "ZREVRANGE %s 0 0 WITHSCORES", key.c_str());
-					if (!top_reply || top_reply->type != REDIS_REPLY_ARRAY || top_reply->elements < 2) {
-						if (top_reply) freeReplyObject(top_reply);
-						if (synthetic_fallback_enabled()) {
-							emit_row(1, 0, 0);
-						}
-						return out.str();
-					}
-					int top_pid = atoi(top_reply->element[0]->str);
-					long long top_score = atoll(top_reply->element[1]->str);
-					freeReplyObject(top_reply);
-
-					redisReply *rreply = (redisReply *)redisCommand(ctx, "ZREVRANK %s %d", key.c_str(), top_pid);
-					if (!rreply || rreply->type != REDIS_REPLY_INTEGER) {
-						if (rreply) freeReplyObject(rreply);
-						if (synthetic_fallback_enabled()) {
-							emit_row(1, top_pid, top_score);
-						}
-						return out.str();
-					}
-					int rank1 = (int)rreply->integer + 1;
-					freeReplyObject(rreply);
-					nick_map = resolve_nicks({top_pid});
-					emit_row(rank1, top_pid, top_score);
-					return out.str();
-				}
-			}
-
 			redisReply *sreply = (redisReply *)redisCommand(ctx, "ZSCORE %s %d", key.c_str(), pid);
 			if (!sreply || sreply->type != REDIS_REPLY_STRING) {
 				if (sreply) freeReplyObject(sreply);
-				if (synthetic_fallback_enabled()) {
-					emit_row(1, pid, 0);
-				}
 				return out.str();
 			}
 			long long score = atoll(sreply->str);
@@ -518,22 +567,55 @@ namespace GHTTP {
 			redisReply *rreply = (redisReply *)redisCommand(ctx, "ZREVRANK %s %d", key.c_str(), pid);
 			if (!rreply || rreply->type != REDIS_REPLY_INTEGER) {
 				if (rreply) freeReplyObject(rreply);
-				if (synthetic_fallback_enabled()) {
-					emit_row(1, pid, score);
-				}
 				return out.str();
 			}
-			int rank1 = (int)rreply->integer + 1;
+			int rank0 = (int)rreply->integer;
 			freeReplyObject(rreply);
-			nick_map = resolve_nicks({pid});
-			emit_row(rank1, pid, score);
+
+			if (rows <= 1) {
+				nick_map = resolve_nicks({pid});
+				emit_row(rank0 + 1, pid, score);
+				return out.str();
+			}
+
+			int half = rows / 2;
+			int start = rank0 - half;
+			if (start < 0) start = 0;
+			int end = start + (rows - 1);
+
+			redisReply *reply = (redisReply *)redisCommand(ctx, "ZREVRANGE %s %d %d WITHSCORES", key.c_str(), start, end);
+			if (!reply || reply->type != REDIS_REPLY_ARRAY) {
+				if (reply) freeReplyObject(reply);
+				return out.str();
+			}
+			if (reply->elements < 2) {
+				freeReplyObject(reply);
+				return out.str();
+			}
+
+			{
+				std::vector<int> pids;
+				pids.reserve(reply->elements / 2);
+				for (size_t i = 0; i + 1 < reply->elements; i += 2) {
+					pids.push_back(atoi(reply->element[i]->str));
+				}
+				nick_map = resolve_nicks(pids);
+			}
+
+			for (size_t i = 0; i + 1 < reply->elements; i += 2) {
+				int row_pid = atoi(reply->element[i]->str);
+				long long row_score = atoll(reply->element[i + 1]->str);
+				emit_row(start + (int)(i / 2) + 1, row_pid, row_score);
+			}
+
+			freeReplyObject(reply);
 			return out.str();
 		}
 
 		// Leaderboard paging/list request.
 		redisReply *reply = NULL;
 		if (anchor >= 0) {
-			reply = (redisReply *)redisCommand(ctx, "ZREVRANGEBYSCORE %s %d -inf LIMIT 0 %d WITHSCORES", key.c_str(), anchor - 1, rows);
+			reply = (redisReply *)redisCommand(ctx, "ZREVRANGEBYSCORE %s %d -inf LIMIT 0 %d WITHSCORES", key.c_str(), anchor, rows);
 		} else {
 			reply = (redisReply *)redisCommand(ctx, "ZREVRANGE %s 0 %d WITHSCORES", key.c_str(), rows - 1);
 		}
@@ -544,9 +626,6 @@ namespace GHTTP {
 		}
 		if (reply->elements < 2) {
 			freeReplyObject(reply);
-			if (synthetic_fallback_enabled()) {
-				emit_row(1, 0, 0);
-			}
 			return out.str();
 		}
 

@@ -72,6 +72,52 @@ namespace GS {
 				redisContext* ctx = TaskShared::getThreadLocalRedisContext();
 				if (ctx) {
 					{
+						std::ostringstream hk;
+						hk << "gstats:sniperelpc:missionstats:" << mission << ":" << pid;
+						std::string hkey = hk.str();
+
+						auto getv = [&](const char *k) -> const char * {
+							auto it = game_data.find(k);
+							if (it == game_data.end()) return "0";
+							if (it->second.empty()) return "0";
+							return it->second.c_str();
+						};
+
+						redisReply* r = (redisReply*)redisCommand(
+							ctx,
+							"HMSET %s "
+							"twoforone %s "
+							"threeforone %s "
+							"fourforone %s "
+							"silentkill %s "
+							"covertkill %s "
+							"2covertkill %s "
+							"3coverkill %s "
+							"headshot %s "
+							"moving %s "
+							"healthlost %s "
+							"accuracy %s "
+							"longestshot %s "
+							"pinpull %s "
+							"difficulty %s",
+							hkey.c_str(),
+							getv("twoforone_0"),
+							getv("threeforone_0"),
+							getv("fourforone_0"),
+							getv("silentkill_0"),
+							getv("covertkill_0"),
+							getv("2covertkill_0"),
+							getv("3coverkill_0"),
+							getv("headshot_0"),
+							getv("moving_0"),
+							getv("healthlost_0"),
+							getv("accuracy_0"),
+							getv("longestshot_0"),
+							getv("pinpull_0"),
+							getv("difficulty_0"));
+						if (r) freeReplyObject(r);
+					}
+					{
 						redisReply* r = (redisReply*)redisCommand(ctx, "ZADD %s %lld %d", "gstats:sniperelpc:total", total, pid);
 						if (r) freeReplyObject(r);
 					}
