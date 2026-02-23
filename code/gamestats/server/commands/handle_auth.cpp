@@ -54,6 +54,17 @@ namespace GS {
 		}
 		m_response = data_parser.GetValue("response");
 
+		if (gamename.compare("sniperelpc") == 0) {
+			m_game = OS::GameData();
+			m_game.gamename = gamename;
+			m_game.secretkey = "hP58dm";
+			if (IsResponseValid(m_response.c_str())) {
+				std::ostringstream ss;
+				ss << "\\lc\\2\\sesskey\\" << m_session_key << "\\proof\\0\\id\\" << local_id;
+				SendPacket(ss.str());
+				return;
+			}
+		}
 
 		GPPersistRequestData *persist_request_data = (GPPersistRequestData *)malloc(sizeof(GPPersistRequestData));
 		persist_request_data->profileid = 0;

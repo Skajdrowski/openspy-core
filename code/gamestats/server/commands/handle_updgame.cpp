@@ -57,6 +57,34 @@ namespace GS {
 		}
 
 		game_data = OS::KeyStringToMap(gamedata);
+
+		// Sniper Elite leaderboard writes (Redis)
+		if (m_game.gamename == "sniperelpc") {
+			auto it_mission = game_data.find("mission");
+			auto it_pid = game_data.find("pid_0");
+			auto it_total = game_data.find("total_0");
+
+			if (it_mission != game_data.end() && it_pid != game_data.end() && it_total != game_data.end()) {
+				int mission = atoi(it_mission->second.c_str());
+				int pid = atoi(it_pid->second.c_str());
+				long long total = _strtoi64(it_total->second.c_str(), nullptr, 10);
+
+				redisContext* ctx = TaskShared::getThreadLocalRedisContext();
+				if (ctx) {
+					{
+						redisReply* r = (redisReply*)redisCommand(ctx, "ZADD %s %lld %d", "gstats:sniperelpc:total", total, pid);
+						if (r) freeReplyObject(r);
+					}
+					{
+						std::ostringstream k;
+						k << "gstats:sniperelpc:mission:" << mission;
+						redisReply* r = (redisReply*)redisCommand(ctx, "ZADD %s %lld %d", k.str().c_str(), total, pid);
+						if (r) freeReplyObject(r);
+					}
+				}
+			}
+		}
+
 		PersistBackendRequest req;
 		req.profileid = m_profile.id;
 		req.mp_peer = this;
